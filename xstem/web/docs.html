@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en" data-mode="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>xstem API</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+<div class="doc">
+<h1>xstem API</h1>
+<p class="mute">Everything the panel does is available over JSON. Create a key under <a href="/#/keys">API keys</a>, then call <code class="mono">/api/...</code> on your panel address. A key has the same rights as the user who made it. The interactive reference lives at <a href="/api/swagger">/api/swagger</a>.</p>
+
+<h2>Authentication</h2>
+<pre class="code">curl -k -H "Authorization: Bearer xs_YOURKEY" https://PANEL:8443/api/guests</pre>
+<p class="mute">The header <code class="mono">X-API-Key: xs_YOURKEY</code> works too. The panel ships with a self-signed certificate, so use <code class="mono">-k</code> or <code class="mono">verify=False</code> until you install your own in <code class="mono">/etc/xstem/cert.pem</code> and <code class="mono">key.pem</code>. Machines can be addressed by numeric id or by name. Errors return <code class="mono">{"detail": "reason"}</code> with a 4xx or 5xx status.</p>
+
+<h2>Endpoints</h2>
+<div style="overflow:auto"><table id="ep"></table></div>
+<p class="mute">Access: <b>user</b> means any key, and users only see their own machines. <b>admin</b> means admin role or root@pam. <b>root</b> means root@pam only.</p>
+
+<h2>Examples</h2>
+<pre class="code"># list machines with live stats
+curl -k -H "Authorization: Bearer $KEY" "https://PANEL:8443/api/guests?stats=1"
+
+# create a VM (admin) - the response contains the generated root password
+curl -k -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"kind":"vm","name":"web-01","image":"debian-12","cores":2,"ram":2048,"disk":20}' \
+  https://PANEL:8443/api/guests
+
+# create a container
+curl -k -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"kind":"ct","name":"box-01","image":"ubuntu/noble","cores":1,"ram":512}' \
+  https://PANEL:8443/api/guests
+
+# reboot by name
+curl -k -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"action":"reboot"}' https://PANEL:8443/api/guests/web-01/power
+
+# forward a public server port to port 80 inside the machine
+curl -k -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"guest_port":80}' https://PANEL:8443/api/guests/web-01/forwards</pre>
+
+<h2>Machine object</h2>
+<pre class="code">{
+  "id": 3, "kind": "vm", "name": "web-01", "owner": "alice", "image": "debian-12",
+  "cores": 2, "ram": 2048, "disk": 20, "ip": "10.77.0.10", "mac": "52:54:00:aa:bb:cc",
+  "status": "running",              // creating | error | stopped | running
+  "forwards": [{"host": 20000, "guest": 22}],
+  "stats": {"running": true, "cpu": 3.2, "mem_used": 412000000, "mem_max": 2147483648,
+            "disk_used": 1100000000, "disk_max": 21474836480,
+            "net_in": 90211, "net_out": 20334, "uptime": 5120}   // net_* are byte counters
+}</pre>
+
+<h2>Discord bot</h2>
+<p class="mute">Needs <code class="mono">pip install discord.py requests</code>. The key owner decides what the bot may touch, so give it a panel user that owns only the machines you want it to control.</p>
+<pre class="code">import asyncio, discord, requests
+from discord import app_commands
+
+PANEL = "https://PANEL:8443"
+KEY = "xs_YOURKEY"
+HEAD = {"Authorization": f"Bearer {KEY}"}
+
+def call(method, path, **kw):
+    r = requests.request(method, f"{PANEL}/api{path}", headers=HEAD, verify=False, timeout=20, **kw)
+    if not r.ok:
+        raise RuntimeError(r.json().get("detail", r.text))
+    return r.json()
+
+async def acall(*a, **kw):
+    return await asyncio.to_thread(call, *a, **kw)
+
+client = discord.Client(intents=discord.Intents.default())
+tree = app_commands.CommandTree(client)
+
+@tree.command(name="vps", description="List your machines")
+async def vps(i: discord.Interaction):
+    await i.response.defer()
+    rows = await acall("GET", "/guests?stats=1")
+    text = "\n".join(f"**{g['name']}** {g['status']} cpu {g['stats']['cpu']}% {g['ip']}" for g in rows) or "No machines."
+    await i.followup.send(text)
+
+@tree.command(name="power", description="start, shutdown, reboot or stop a machine")
+@app_commands.choices(action=[app_commands.Choice(name=a, value=a) for a in ("start", "shutdown", "reboot", "stop")])
+async def power(i: discord.Interaction, name: str, action: app_commands.Choice[str]):
+    await i.response.defer()
+    try:
+        await acall("POST", f"/guests/{name}/power", json={"action": action.value})
+        await i.followup.send(f"{action.value} sent to {name}")
+    except Exception as e:
+        await i.followup.send(f"Failed: {e}")
+
+@client.event
+async def on_ready():
+    await tree.sync()
+
+client.run("DISCORD_BOT_TOKEN")</pre>
+
+<h2>Console over WebSocket</h2>
+<p class="mute">Connect to <code class="mono">wss://PANEL:8443/ws/console/ID?key=xs_YOURKEY</code>. Send keystrokes as text frames, and send <code class="mono">{"resize":[cols,rows]}</code> to resize. Output arrives as binary frames.</p>
+</div>
+<script>
+const E = [
+['POST','/api/login','public','{"realm":"panel|pam","username":"..","password":".."} Starts a browser session cookie.'],
+['GET','/api/me','user','Who the key belongs to.'],
+['GET','/api/guests?stats=1','user','List machines. Stats are optional.'],
+['POST','/api/guests','admin','{"kind":"vm|ct","name","image","cores","ram","disk","password","owner","autostart"} Returns id and root password. Image is an image key for a VM (debian-12) and dist/release for a container (debian/bookworm).'],
+['GET','/api/guests/{id|name}','user','One machine with stats.'],
+['GET','/api/guests/{id|name}/stats','user','Stats only.'],
+['PATCH','/api/guests/{id|name}','admin','{"autostart":true,"owner":"alice"}'],
+['DELETE','/api/guests/{id|name}','admin','Stops and destroys the machine and its disk.'],
+['POST','/api/guests/{id|name}/power','user','{"action":"start|shutdown|reboot|stop"} shutdown is graceful, stop is forced.'],
+['POST','/api/guests/{id|name}/eject','user','Detach the install ISO on next start.'],
+['POST','/api/guests/{id|name}/forwards','user','{"guest_port":80} Assigns a free server port (20000-29999).'],
+['DELETE','/api/guests/{id|name}/forwards/{host_port}','user','Remove a forward. The SSH forward stays.'],
+['GET','/api/images','user','Images and container templates.'],
+['POST','/api/images','admin','{"name","url","kind":"cloud|iso"} Downloads from a URL.'],
+['POST','/api/images/{id}/download','admin','Download a catalog image.'],
+['DELETE','/api/images/{id}','admin','Delete the file.'],
+['GET','/api/node/stats','admin','CPU, memory, disk, load, uptime and machine counts.'],
+['GET','/api/nodes','root','All linked nodes with stats.'],
+['POST','/api/nodes','root','{"name","url","token"} Link a node using its node token.'],
+['DELETE','/api/nodes/{id}','root','Unlink.'],
+['ANY','/api/n/{node_id}/...','root','Run any call above on a linked node, for example /api/n/2/guests.'],
+['GET','/api/users','root','List panel users.'],
+['POST','/api/users','root','{"name","password","role":"user|admin"}'],
+['PATCH','/api/users/{name}','root','{"password","role","disabled"}'],
+['DELETE','/api/users/{name}','root','Delete a user.'],
+['GET','/api/keys','user','Your keys.'],
+['POST','/api/keys','user','{"name"} Returns the key once.'],
+['DELETE','/api/keys/{id}','user','Revoke.'],
+['GET','/api/events','admin','Last 100 journal entries.'],
+['GET','/api/settings','root','Appearance settings.'],
+['PUT','/api/settings','root','Brand, accent, mode, dim, css, bg_type, bg_url.']
+];
+document.getElementById('ep').innerHTML = '<tr><th>Method</th><th>Path</th><th>Access</th><th>Notes</th></tr>' + E.map(r => '<tr><td><code class="mono">' + r[0] + '</code></td><td><code class="mono">' + r[1] + '</code></td><td>' + r[2] + '</td><td class="mute">' + r[3].replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</td></tr>').join('');
+fetch('/api/public').then(r => r.json()).then(p => { document.documentElement.dataset.mode = p.mode; document.documentElement.style.setProperty('--accent', p.accent); document.title = p.brand + ' API'; }).catch(() => {});
+</script>
+</body>
+</html>

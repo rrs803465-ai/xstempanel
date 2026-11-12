@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# xstem panel - single-file installer (Debian 11+/Ubuntu 22.04+, run as root).
+# The whole panel is embedded below. Nothing is fetched from GitHub except OS packages and images.
+#   curl -fsSL https://raw.githubusercontent.com/rrs803465-ai/xstempanel/main/install.sh | sudo bash
+# Options (environment): XSTEM_PORT=8443  XSTEM_SKIP_IMAGES=1 (skip the big image downloads)
+
+main() {
+  set -euo pipefail
+  DIR=/opt/xstem
+  PORT="${XSTEM_PORT:-8443}"
+
+  if [ "${1:-}" = "--extract" ]; then
+    mkdir -p "${2:?target dir}"
+    payload | tar -xz -C "$2"
+    echo "extracted to $2"; return 0
+  fi
+
+  [ "$(id -u)" = 0 ] || { echo "Run as root: curl -fsSL <url> | sudo bash"; exit 1; }
+  command -v apt-get >/dev/null || { echo "xstem supports Debian and Ubuntu hosts."; exit 1; }
+  [ -d /run/systemd/system ] || { echo "systemd is required."; exit 1; }
+  [ "$(uname -m)" = x86_64 ] || { echo "x86_64 hosts only."; exit 1; }
+
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+  echo "== [1/5] base packages"
+  apt-get update -qq </dev/null
+  apt-get install -y -qq python3 python3-venv python3-pip curl ca-certificates openssl tar libpam0g </dev/null >/dev/null
+
+  echo "== [2/5] panel files"
+  mkdir -p "$DIR" /etc/xstem /var/lib/xstem
+  rm -rf "$DIR/xstem"
+  payload | tar -xz -C "$DIR"
+
+  echo "== [3/5] python environment"
+  [ -x "$DIR/venv/bin/python" ] || python3 -m venv "$DIR/venv"
+  "$DIR/venv/bin/pip" install -q --upgrade pip </dev/null >/dev/null
+  "$DIR/venv/bin/pip" install -q -r "$DIR/requirements.txt" </dev/null
+
+  if [ ! -f /etc/xstem/cert.pem ]; then
+    SAN="DNS:localhost,DNS:$(hostname),IP:127.0.0.1"
+    for ip in $(hostname -I 2>/dev/null); do SAN="$SAN,IP:$ip"; done
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout /etc/xstem/key.pem -out /etc/xstem/cert.pem \
+      -subj "/CN=xstem" -addext "subjectAltName=$SAN" >/dev/null 2>&1
+    chmod 600 /etc/xstem/key.pem
+  fi
+  printf '@include common-auth\n@include common-account\n' > /etc/pam.d/xstem
+
+  echo "== [4/5] installing QEMU, LXC, network, console assets, images"
+  (cd "$DIR" && "$DIR/venv/bin/python" -m xstem setup </dev/null)
+
+  cat > /etc/systemd/system/xstem.service <<UNIT
+[Unit]
+Description=xstem VM and container panel
+After=network-online.target lxcfs.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=$DIR
+Environment=XSTEM_PORT=$PORT
+ExecStart=$DIR/venv/bin/python -m xstem
+Restart=always
+RestartSec=3
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  echo "== [5/5] starting panel"
+  systemctl daemon-reload
+  systemctl enable xstem >/dev/null 2>&1
+  systemctl restart xstem
+  for _ in $(seq 1 40); do
+    curl -ksf "https://127.0.0.1:$PORT/api/public" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  TOKEN="$(cd "$DIR" && "$DIR/venv/bin/python" -m xstem token 2>/dev/null || true)"
+  cat <<MSG
+
+xstem is running.
+  Open        https://${IP:-your-server-ip}:$PORT
+  Sign in     realm "Linux PAM", user root, with the server's root password
+              (no root password yet? run: passwd root)
+  Node token  $TOKEN
+              (paste it into another panel's Nodes page to link this server)
+  Update      run the same curl command again, data is kept
+MSG
+}
+
+payload() {
+  base64 -d <<'XSTEM_PAYLOAD'
+@@PAYLOAD@@
+XSTEM_PAYLOAD
+}
+
+main "$@"
+exit $?
